@@ -5,11 +5,11 @@ Nokturn is a Rust toolchain that turns an OpenAPI v3 specification into an idiom
 ## Workspace layout
 
 - `crates/nokturn-core`: Loads OpenAPI v3 (JSON/YAML), applies a small sanitization pass, resolves component references, and defines the canonical IR for code generation.
-- `crates/nokturn-gen`: CLI wrapper (binary name: `nokturn-gen`) that reads the config/spec, resolves the schema, and is the home for upcoming SDK generation.
+- `crates/nokturn-gen`: CLI wrapper (binary name: `nokturn-gen`) that reads the config/spec, lowers the schema, and emits the generated crate layout.
 
 ## Status
 
-Code generation is in progress. Today `nokturn-gen generate` validates the config and resolves the OpenAPI spec, but does not yet emit SDK source files.
+Code generation is in progress. Today `nokturn-gen generate` emits a compilable crate layout with package metadata, `src/lib.rs`, generated model types, operation modules, and a `reqwest`-backed client surface. Typed execution is currently limited to the subset of response shapes the generator can decode safely.
 
 ## Build
 

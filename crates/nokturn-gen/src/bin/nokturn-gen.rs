@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use anyhow::Context;
-use nokturn_core::resolve_spec;
-use nokturn_gen::{Cli, Commands, Config};
+use nokturn_gen::{Cli, Commands, Config, generate::generate_sdk};
 use structopt::StructOpt;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
@@ -49,8 +48,9 @@ async fn main() -> anyhow::Result<()> {
             let d = fs::read_to_string(&args.schema)
                 .await
                 .with_context(|| "failed to read openapi schema")?;
-            let _resolved = resolve_spec(d.as_str(), ext)
-                .with_context(|| " failed to resolve openapi schema")?;
+            generate_sdk(&_config, d.as_str(), ext, &args.output)
+                .await
+                .with_context(|| "failed to generate sdk")?;
         }
     }
 

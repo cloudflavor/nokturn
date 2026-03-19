@@ -1,5 +1,11 @@
 use std::collections::BTreeMap;
 
+use crate::{lowering, resolver::ResolvedSpec, utils::HttpMethod};
+
+pub fn build_api_ir(resolved: &ResolvedSpec<'_>) -> ApiIr {
+    lowering::build_api_ir(resolved)
+}
+
 /// Canonical IR extracted from an OpenAPI 3.0 document for downstream codegen.
 #[derive(Debug, Clone)]
 pub struct ApiIr {
@@ -162,25 +168,13 @@ pub struct Operation {
     pub id: String,
     pub path: String,
     pub method: HttpMethod,
-    pub tag: Option<String>,
+    pub tags: Vec<String>,
     pub summary: Option<String>,
     pub docs: Option<String>,
     pub deprecated: bool,
     pub params: Vec<ParameterIr>,
     pub request_body: Option<RequestBodyIr>,
     pub responses: Vec<ResponseIr>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum HttpMethod {
-    Get,
-    Put,
-    Post,
-    Delete,
-    Options,
-    Head,
-    Patch,
-    Trace,
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +191,7 @@ pub struct ParameterIr {
     pub example: Option<LiteralValue>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParameterLocation {
     Path,
     Query,

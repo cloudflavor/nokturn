@@ -13,20 +13,26 @@
 // limitations under the License.
 
 pub mod ir;
+pub mod lowering;
 pub mod resolver;
+pub mod utils;
 
-use crate::resolver::EagerResolver;
+use crate::{lowering::LoweredApi, resolver::EagerResolver};
 use anyhow::{Result, bail};
 use tracing::trace;
 
 pub fn resolve_spec(spec: &str, ext: &str) -> Result<()> {
+    let _lowered = lower_spec(spec, ext)?;
+    Ok(())
+}
+
+pub fn lower_spec(spec: &str, ext: &str) -> Result<LoweredApi> {
     trace!("resolving schema");
     let s = sanitize_spec(spec);
     let schema = load_openapiv3(s.as_str(), ext)?;
-    let mut resolver = EagerResolver::new(&schema);
-    let _resolved_schema = resolver.resolve();
-
-    Ok(())
+    let resolver = EagerResolver::new(&schema);
+    let resolved_schema = resolver.resolve()?;
+    Ok(crate::lowering::build_lowered_api(&resolved_schema))
 }
 
 pub fn load_openapiv3(spec: &str, ext: &str) -> Result<openapiv3::OpenAPI> {

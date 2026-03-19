@@ -12,57 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::utils::{HttpMethod, decode_pointer_segment};
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use indexmap::IndexMap;
 use openapiv3::{
     AdditionalProperties, AnySchema, Callback, Example, Header, Link, LinkOperation, MediaType,
-    OpenAPI, Parameter, ParameterSchemaOrContent, PathItem, ReferenceOr, RequestBody, Response,
-    Responses, Schema, SchemaKind, SecurityScheme, Type,
+    OpenAPI, Operation as OAPIOperation, Parameter, ParameterSchemaOrContent, PathItem,
+    ReferenceOr, RequestBody, Response, Responses, Schema, SchemaKind, SecurityScheme, Type,
 };
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, warn};
+use tracing::warn;
 
 #[derive(Debug)]
 pub(crate) struct ResolvedCache<'a> {
-    paths: HashMap<&'a str, &'a PathItem>,
+    paths: IndexMap<&'a str, &'a PathItem>,
     params: HashMap<&'a str, &'a Parameter>,
     schemas: HashMap<&'a str, &'a Schema>,
-    responses: HashMap<String, &'a Response>,
+    responses: HashMap<&'a str, &'a Response>,
     headers: HashMap<&'a str, &'a Header>,
     callbacks: HashMap<&'a str, &'a Callback>,
     req_bodies: HashMap<RequestBodyKey<'a>, &'a RequestBody>,
     examples: HashMap<&'a str, &'a Example>,
     links: HashMap<&'a str, &'a Link>,
     security_schemes: HashMap<&'a str, &'a SecurityScheme>,
-}
-
-#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
-enum HttpMethod {
-    Get,
-    Put,
-    Post,
-    Delete,
-    Patch,
-    Options,
-    Head,
-    Trace,
-}
-
-impl HttpMethod {
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "get" | "GET" => Some(Self::Get),
-            "put" | "PUT" => Some(Self::Put),
-            "post" | "POST" => Some(Self::Post),
-            "delete" | "DELETE" => Some(Self::Delete),
-            "patch" | "PATCH" => Some(Self::Patch),
-            "options" | "OPTIONS" => Some(Self::Options),
-            "head" | "HEAD" => Some(Self::Head),
-            "trace" | "TRACE" => Some(Self::Trace),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -75,6 +49,37 @@ enum RequestBodyKey<'a> {
 struct OperationLocator<'a> {
     path: &'a str,
     method: HttpMethod,
+}
+
+pub struct ResolvedSpec<'a> {
+    spec: &'a OpenAPI,
+    cache: ResolvedCache<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveResult<'a, T> {
+    Resolved(&'a T),
+    MissingReference { reference: &'a str },
+    UnsupportedReference { reference: &'a str },
+    Cycle { reference: &'a str },
+}
+
+impl<'a, T> ResolveResult<'a, T> {
+    pub fn into_option(self) -> Option<&'a T> {
+        match self {
+            Self::Resolved(value) => Some(value),
+            Self::MissingReference { .. }
+            | Self::UnsupportedReference { .. }
+            | Self::Cycle { .. } => None,
+        }
+    }
+}
+
+pub struct OperationEntry<'a> {
+    pub path: &'a str,
+    pub method: HttpMethod,
+    pub operation: &'a OAPIOperation,
+    pub path_item: &'a PathItem,
 }
 
 pub struct EagerResolver<'a> {
@@ -121,7 +126,7 @@ impl<'a> EagerResolver<'a> {
             // resolved: None,
             cache: ResolvedCache {
                 req_bodies: HashMap::with_capacity(rbody_cap),
-                paths: HashMap::with_capacity(paths_cap),
+                paths: IndexMap::with_capacity(paths_cap),
                 params: HashMap::with_capacity(param_cap),
                 schemas: HashMap::with_capacity(schema_cap),
                 responses: HashMap::with_capacity(response_cap),
@@ -136,10 +141,27 @@ impl<'a> EagerResolver<'a> {
         }
     }
 
-    pub fn resolve(&mut self) -> Result<()> {
+    pub fn resolve(mut self) -> Result<ResolvedSpec<'a>> {
+        self.resolve_component_schemas()
+            .with_context(|| "failed to resolve component schemas")?;
         self.resolve_paths()
             .with_context(|| "failed to resolve paths")?;
-        debug!("{:#?}", self.cache.req_bodies);
+
+        Ok(ResolvedSpec {
+            spec: self.spec,
+            cache: self.cache,
+        })
+    }
+
+    fn resolve_component_schemas(&mut self) -> Result<()> {
+        let Some(components) = self.spec.components.as_ref() else {
+            return Ok(());
+        };
+
+        let schema_names: Vec<&'a str> = components.schemas.keys().map(String::as_str).collect();
+        for name in schema_names {
+            self.resolve_schema_component_ref(name)?;
+        }
 
         Ok(())
     }
@@ -147,29 +169,72 @@ impl<'a> EagerResolver<'a> {
     fn resolve_paths(&mut self) -> Result<()> {
         for (name, path_item) in self.spec.paths.iter() {
             match path_item {
-                ReferenceOr::Item(item) => {
-                    self.record_operation_ids(name.as_str(), item);
-                    self.resolve_operation(name.as_str(), item)?;
-                    self.cache.paths.insert(name, item);
-                }
+                ReferenceOr::Item(item) => self.cache_path_item(name.as_str(), item)?,
                 ReferenceOr::Reference { reference } => {
-                    self.resolve_ref(reference)?;
+                    self.resolve_path_alias(name.as_str(), reference)?;
                 }
             }
         }
         Ok(())
     }
 
+    fn cache_path_item(&mut self, path: &'a str, path_item: &'a PathItem) -> Result<()> {
+        self.record_operation_ids(path, path_item);
+        self.resolve_operation(path, path_item)?;
+        self.cache.paths.insert(path, path_item);
+        Ok(())
+    }
+
+    fn resolve_path_alias(&mut self, alias_path: &'a str, reference: &'a str) -> Result<()> {
+        self.resolve_ref(reference)?;
+
+        let target_path = match ComponentRef::parse(reference) {
+            Some(ComponentRef::PathItem { path_segment }) => decode_pointer_segment(path_segment),
+            _ => {
+                return Err(anyhow!(
+                    "path item reference did not resolve to a path item: {reference}"
+                ));
+            }
+        };
+
+        let target = self
+            .cache
+            .paths
+            .get(target_path.as_str())
+            .copied()
+            .ok_or_else(|| anyhow!("resolved path cache missing target: {reference}"))?;
+
+        self.record_operation_ids(alias_path, target);
+        self.cache.paths.insert(alias_path, target);
+
+        Ok(())
+    }
+
     fn resolve_operation(&mut self, path: &'a str, path_item: &'a PathItem) -> Result<()> {
+        for param in &path_item.parameters {
+            self.resolve_parameter_or(param)?;
+        }
+
         for (method, op) in iterate_operations(path_item) {
-            for param in &op.parameters {
-                self.resolve_parameter_or(param)?;
-            }
-            self.resolve_responses(&op.responses)?;
-            self.resolve_req_body(path, method, op.request_body.as_ref())?;
-            for callback in op.callbacks.values() {
-                self.resolve_callback(callback)?;
-            }
+            self.resolve_operation_entry(path, method, op)?;
+        }
+
+        Ok(())
+    }
+
+    fn resolve_operation_entry(
+        &mut self,
+        path: &'a str,
+        method: HttpMethod,
+        operation: &'a OAPIOperation,
+    ) -> Result<()> {
+        for param in &operation.parameters {
+            self.resolve_parameter_or(param)?;
+        }
+        self.resolve_responses(&operation.responses)?;
+        self.resolve_req_body(path, method, operation.request_body.as_ref())?;
+        for callback in operation.callbacks.values() {
+            self.resolve_callback(callback)?;
         }
 
         Ok(())
@@ -189,17 +254,15 @@ impl<'a> EagerResolver<'a> {
             match default_resp {
                 ReferenceOr::Item(item) => {
                     self.resolve_response(item)?;
-                    self.cache.responses.insert("default".to_string(), item);
                 }
                 ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref())?,
             }
         }
 
-        for (status, resp) in responses.responses.iter() {
+        for resp in responses.responses.values() {
             match resp {
                 ReferenceOr::Item(item) => {
                     self.resolve_response(item)?;
-                    self.cache.responses.insert(status.to_string(), item);
                 }
                 ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref())?,
             }
@@ -223,13 +286,12 @@ impl<'a> EagerResolver<'a> {
     where
         I: Iterator<Item = (&'a String, &'a ReferenceOr<Header>)>,
     {
-        for (name, header) in headers {
+        for (_name, header) in headers {
             match header {
                 ReferenceOr::Item(item) => {
-                    self.cache.headers.insert(name, item);
                     self.resolve_header(item)?;
                 }
-                ReferenceOr::Reference { reference } => self.resolve_ref(reference)?,
+                ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref())?,
             }
         }
         Ok(())
@@ -270,10 +332,9 @@ impl<'a> EagerResolver<'a> {
 
         match req_body {
             ReferenceOr::Item(item) => {
-                self.cache.req_bodies.insert(
-                    RequestBodyKey::Operation { path, method },
-                    item,
-                );
+                self.cache
+                    .req_bodies
+                    .insert(RequestBodyKey::Operation { path, method }, item);
                 self.resolve_request_body(item)
             }
             ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
@@ -340,9 +401,7 @@ impl<'a> EagerResolver<'a> {
 
     fn resolve_link(&mut self, link: &'a Link) -> Result<()> {
         match &link.operation {
-            LinkOperation::OperationRef(reference) => {
-                self.resolve_operation_reference(reference.as_str())
-            }
+            LinkOperation::OperationRef(reference) => self.resolve_ref(reference.as_str()),
             LinkOperation::OperationId(operation_id) => {
                 self.resolve_operation_id(operation_id.as_str())
             }
@@ -356,10 +415,7 @@ impl<'a> EagerResolver<'a> {
         }
     }
 
-    fn resolve_boxed_schema_ref(
-        &mut self,
-        schema: &'a ReferenceOr<Box<Schema>>,
-    ) -> Result<()> {
+    fn resolve_boxed_schema_ref(&mut self, schema: &'a ReferenceOr<Box<Schema>>) -> Result<()> {
         match schema {
             ReferenceOr::Item(item) => self.resolve_schema(item.as_ref()),
             ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
@@ -404,10 +460,10 @@ impl<'a> EagerResolver<'a> {
                 for property in object.properties.values() {
                     self.resolve_boxed_schema_ref(property)?;
                 }
-                if let Some(additional) = &object.additional_properties {
-                    if let AdditionalProperties::Schema(schema) = additional {
-                        self.resolve_schema_ref(schema.as_ref())?;
-                    }
+                if let Some(additional) = &object.additional_properties
+                    && let AdditionalProperties::Schema(schema) = additional
+                {
+                    self.resolve_schema_ref(schema.as_ref())?;
                 }
                 Ok(())
             }
@@ -419,10 +475,10 @@ impl<'a> EagerResolver<'a> {
         for property in schema.properties.values() {
             self.resolve_boxed_schema_ref(property)?;
         }
-        if let Some(additional) = &schema.additional_properties {
-            if let AdditionalProperties::Schema(schema) = additional {
-                self.resolve_schema_ref(schema.as_ref())?;
-            }
+        if let Some(additional) = &schema.additional_properties
+            && let AdditionalProperties::Schema(schema) = additional
+        {
+            self.resolve_schema_ref(schema.as_ref())?;
         }
         if let Some(items) = &schema.items {
             self.resolve_boxed_schema_ref(items)?;
@@ -454,7 +510,22 @@ impl<'a> EagerResolver<'a> {
                 self.cache.params.insert(name, item);
                 self.resolve_parameter(item)
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::Parameter(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "parameter reference did not resolve to a parameter: {reference}"
+                        ));
+                    }
+                };
+                let target = self.cache.params.get(target_name).copied().ok_or_else(|| {
+                    anyhow!("resolved parameter cache missing target: {reference}")
+                })?;
+                self.cache.params.insert(name, target);
+                Ok(())
+            }
         }
     }
 
@@ -467,14 +538,20 @@ impl<'a> EagerResolver<'a> {
             Some(ComponentRef::Parameter(name)) => self.resolve_parameter_ref(name),
             Some(ComponentRef::Response(name)) => self.resolve_response_ref(name),
             Some(ComponentRef::Header(name)) => self.resolve_header_ref(name),
-            Some(ComponentRef::Schema(name)) => self.resolve_schema_component(name),
+            Some(ComponentRef::Schema(name)) => self.resolve_schema_component_ref(name),
             Some(ComponentRef::Callback(name)) => self.resolve_callback_ref(name),
-            Some(ComponentRef::RequestBody(name)) => self.resolve_request_body_component(name),
-            Some(ComponentRef::Example(name)) => self.resolve_example_component(name),
-            Some(ComponentRef::Link(name)) => self.resolve_link_component(name),
-            Some(ComponentRef::SecurityScheme(name)) => {
-                self.resolve_security_scheme_component(name)
+            Some(ComponentRef::RequestBody(name)) => self.resolve_request_body_ref(name),
+            Some(ComponentRef::Example(name)) => self.resolve_example_ref(name),
+            Some(ComponentRef::Link(name)) => self.resolve_link_ref(name),
+            Some(ComponentRef::SecurityScheme(name)) => self.resolve_security_scheme_ref(name),
+            Some(ComponentRef::PathItem { path_segment }) => {
+                self.resolve_path_item_ref(path_segment)
             }
+            Some(ComponentRef::PathOperation {
+                path_segment,
+                method,
+                has_extra,
+            }) => self.resolve_path_operation_ref(path_segment, method, has_extra),
             None => {
                 warn!("unresolved component reference: {reference}");
                 Err(anyhow!("unresolved component reference: {reference} "))
@@ -497,10 +574,30 @@ impl<'a> EagerResolver<'a> {
 
         match &comps.responses[name] {
             ReferenceOr::Item(item) => {
-                self.cache.responses.insert(name.to_string(), &item);
+                self.cache.responses.insert(name, item);
                 self.resolve_response(item)
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::Response(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "response reference did not resolve to a response: {reference}"
+                        ));
+                    }
+                };
+                let target = self
+                    .cache
+                    .responses
+                    .get(target_name)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!("resolved response cache missing target: {reference}")
+                    })?;
+                self.cache.responses.insert(name, target);
+                Ok(())
+            }
         }
     }
 
@@ -513,14 +610,32 @@ impl<'a> EagerResolver<'a> {
 
         match &comps.headers[name] {
             ReferenceOr::Item(item) => {
-                self.cache.headers.insert(name, &item);
+                self.cache.headers.insert(name, item);
                 self.resolve_header(item)
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::Header(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "header reference did not resolve to a header: {reference}"
+                        ));
+                    }
+                };
+                let target = self
+                    .cache
+                    .headers
+                    .get(target_name)
+                    .copied()
+                    .ok_or_else(|| anyhow!("resolved header cache missing target: {reference}"))?;
+                self.cache.headers.insert(name, target);
+                Ok(())
+            }
         }
     }
 
-    fn resolve_schema_component(&mut self, name: &'a str) -> Result<()> {
+    fn resolve_schema_component_ref(&mut self, name: &'a str) -> Result<()> {
         let comps = self
             .spec
             .components
@@ -529,10 +644,28 @@ impl<'a> EagerResolver<'a> {
 
         match &comps.schemas[name] {
             ReferenceOr::Item(item) => {
-                self.cache.schemas.insert(name, &item);
+                self.cache.schemas.insert(name, item);
                 self.resolve_schema(item)
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::Schema(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "schema reference did not resolve to a schema: {reference}"
+                        ));
+                    }
+                };
+                let target = self
+                    .cache
+                    .schemas
+                    .get(target_name)
+                    .copied()
+                    .ok_or_else(|| anyhow!("resolved schema cache missing target: {reference}"))?;
+                self.cache.schemas.insert(name, target);
+                Ok(())
+            }
         }
     }
 
@@ -545,14 +678,34 @@ impl<'a> EagerResolver<'a> {
 
         match &comps.callbacks[name] {
             ReferenceOr::Item(item) => {
-                self.cache.callbacks.insert(name, &item);
+                self.cache.callbacks.insert(name, item);
                 self.resolve_callback(item)
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::Callback(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "callback reference did not resolve to a callback: {reference}"
+                        ));
+                    }
+                };
+                let target = self
+                    .cache
+                    .callbacks
+                    .get(target_name)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!("resolved callback cache missing target: {reference}")
+                    })?;
+                self.cache.callbacks.insert(name, target);
+                Ok(())
+            }
         }
     }
 
-    fn resolve_request_body_component(&mut self, name: &'a str) -> Result<()> {
+    fn resolve_request_body_ref(&mut self, name: &'a str) -> Result<()> {
         let comps = self
             .spec
             .components
@@ -566,11 +719,33 @@ impl<'a> EagerResolver<'a> {
                     .insert(RequestBodyKey::Component(name), item);
                 self.resolve_request_body(item)
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::RequestBody(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "request body reference did not resolve to a request body: {reference}"
+                        ));
+                    }
+                };
+                let target = self
+                    .cache
+                    .req_bodies
+                    .get(&RequestBodyKey::Component(target_name))
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!("resolved request body cache missing target: {reference}")
+                    })?;
+                self.cache
+                    .req_bodies
+                    .insert(RequestBodyKey::Component(name), target);
+                Ok(())
+            }
         }
     }
 
-    fn resolve_example_component(&mut self, name: &'a str) -> Result<()> {
+    fn resolve_example_ref(&mut self, name: &'a str) -> Result<()> {
         let comps = self
             .spec
             .components
@@ -582,11 +757,29 @@ impl<'a> EagerResolver<'a> {
                 self.cache.examples.insert(name, item);
                 Ok(())
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::Example(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "example reference did not resolve to an example: {reference}"
+                        ));
+                    }
+                };
+                let target = self
+                    .cache
+                    .examples
+                    .get(target_name)
+                    .copied()
+                    .ok_or_else(|| anyhow!("resolved example cache missing target: {reference}"))?;
+                self.cache.examples.insert(name, target);
+                Ok(())
+            }
         }
     }
 
-    fn resolve_link_component(&mut self, name: &'a str) -> Result<()> {
+    fn resolve_link_ref(&mut self, name: &'a str) -> Result<()> {
         let comps = self
             .spec
             .components
@@ -598,11 +791,27 @@ impl<'a> EagerResolver<'a> {
                 self.cache.links.insert(name, item);
                 self.resolve_link(item)
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::Link(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "link reference did not resolve to a link: {reference}"
+                        ));
+                    }
+                };
+                let target =
+                    self.cache.links.get(target_name).copied().ok_or_else(|| {
+                        anyhow!("resolved link cache missing target: {reference}")
+                    })?;
+                self.cache.links.insert(name, target);
+                Ok(())
+            }
         }
     }
 
-    fn resolve_security_scheme_component(&mut self, name: &'a str) -> Result<()> {
+    fn resolve_security_scheme_ref(&mut self, name: &'a str) -> Result<()> {
         let comps = self
             .spec
             .components
@@ -614,14 +823,35 @@ impl<'a> EagerResolver<'a> {
                 self.cache.security_schemes.insert(name, item);
                 Ok(())
             }
-            ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_ref(reference.as_ref())?;
+                let target_name = match ComponentRef::parse(reference.as_ref()) {
+                    Some(ComponentRef::SecurityScheme(target_name)) => target_name,
+                    _ => {
+                        return Err(anyhow!(
+                            "security scheme reference did not resolve to a security scheme: {reference}"
+                        ));
+                    }
+                };
+                let target = self
+                    .cache
+                    .security_schemes
+                    .get(target_name)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!("resolved security scheme cache missing target: {reference}")
+                    })?;
+                self.cache.security_schemes.insert(name, target);
+                Ok(())
+            }
         }
     }
 
     fn resolve_operation_id(&mut self, operation_id: &'a str) -> Result<()> {
-        let locator = self.operation_ids.get(operation_id).ok_or_else(|| {
-            anyhow!("link references unknown operationId: {operation_id}")
-        })?;
+        let locator = self
+            .operation_ids
+            .get(operation_id)
+            .ok_or_else(|| anyhow!("link references unknown operationId: {operation_id}"))?;
 
         let path_entry = self
             .spec
@@ -638,35 +868,14 @@ impl<'a> EagerResolver<'a> {
         }
     }
 
-    fn resolve_operation_reference(&mut self, reference: &'a str) -> Result<()> {
-        let pointer = match reference.strip_prefix('#') {
-            Some(pointer) => pointer,
-            None => return Ok(()),
-        };
-
-        self.resolve_operation_pointer(pointer)
-    }
-
-    fn resolve_operation_pointer(&mut self, pointer: &'a str) -> Result<()> {
-        let mut segments = pointer.split('/').filter(|segment| !segment.is_empty());
-
-        match segments.next() {
-            Some("paths") => {}
-            _ => {
-                warn!("link operationRef points outside /paths: #{pointer}");
-                return Ok(());
-            }
-        }
-
-        let path_segment = segments
-            .next()
-            .ok_or_else(|| anyhow!("link operationRef missing path segment: #{pointer}"))?;
-        let method_segment = segments
-            .next()
-            .ok_or_else(|| anyhow!("link operationRef missing method segment: #{pointer}"))?;
-
-        if segments.next().is_some() {
-            warn!("link operationRef has extra pointer segments: #{pointer}");
+    fn resolve_path_operation_ref(
+        &mut self,
+        path_segment: &'a str,
+        method: HttpMethod,
+        has_extra: bool,
+    ) -> Result<()> {
+        if has_extra {
+            warn!("link operationRef has extra pointer segments");
         }
 
         let decoded_path = decode_pointer_segment(path_segment);
@@ -676,12 +885,29 @@ impl<'a> EagerResolver<'a> {
             .paths
             .get_key_value(decoded_path.as_str())
             .ok_or_else(|| anyhow!("link references unknown path: {decoded_path}"))?;
-        let method = HttpMethod::from_str(method_segment)
-            .ok_or_else(|| anyhow!("link references unsupported HTTP method: {method_segment}"))?;
 
         match path_item {
-            ReferenceOr::Item(item) => self.resolve_single_operation(method, path_name.as_str(), item),
+            ReferenceOr::Item(item) => {
+                self.resolve_single_operation(method, path_name.as_str(), item)
+            }
             ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref()),
+        }
+    }
+
+    fn resolve_path_item_ref(&mut self, path_segment: &'a str) -> Result<()> {
+        let decoded_path = decode_pointer_segment(path_segment);
+        let (path_name, path_item) = self
+            .spec
+            .paths
+            .paths
+            .get_key_value(decoded_path.as_str())
+            .ok_or_else(|| anyhow!("path item reference targets unknown path: {decoded_path}"))?;
+
+        match path_item {
+            ReferenceOr::Item(item) => self.cache_path_item(path_name.as_str(), item),
+            ReferenceOr::Reference { reference } => {
+                self.resolve_path_alias(path_name.as_str(), reference)
+            }
         }
     }
 
@@ -692,46 +918,19 @@ impl<'a> EagerResolver<'a> {
         path_item: &'a PathItem,
     ) -> Result<()> {
         if let Some(operation) = find_operation_by_method(path_item, method) {
-            for param in &operation.parameters {
+            for param in &path_item.parameters {
                 self.resolve_parameter_or(param)?;
             }
-            self.resolve_responses(&operation.responses)?;
-            self.resolve_req_body(path, method, operation.request_body.as_ref())?;
-            for callback in operation.callbacks.values() {
-                self.resolve_callback(callback)?;
-            }
+            self.resolve_operation_entry(path, method, operation)?;
         }
 
         Ok(())
     }
 }
 
-fn decode_pointer_segment(segment: &str) -> String {
-    let mut result = String::with_capacity(segment.len());
-    let mut chars = segment.chars();
-
-    while let Some(ch) = chars.next() {
-        if ch == '~' {
-            match chars.next() {
-                Some('0') => result.push('~'),
-                Some('1') => result.push('/'),
-                Some(other) => {
-                    result.push('~');
-                    result.push(other);
-                }
-                None => result.push('~'),
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    result
-}
-
-fn iterate_operations<'a>(
-    path_item: &'a PathItem,
-) -> impl Iterator<Item = (HttpMethod, &'a openapiv3::Operation)> {
+fn iterate_operations(
+    path_item: &PathItem,
+) -> impl Iterator<Item = (HttpMethod, &openapiv3::Operation)> {
     [
         (HttpMethod::Get, path_item.get.as_ref()),
         (HttpMethod::Put, path_item.put.as_ref()),
@@ -746,10 +945,10 @@ fn iterate_operations<'a>(
     .filter_map(|(method, op)| op.map(|operation| (method, operation)))
 }
 
-fn find_operation_by_method<'a>(
-    path_item: &'a PathItem,
+fn find_operation_by_method(
+    path_item: &PathItem,
     method: HttpMethod,
-) -> Option<&'a openapiv3::Operation> {
+) -> Option<&openapiv3::Operation> {
     match method {
         HttpMethod::Get => path_item.get.as_ref(),
         HttpMethod::Put => path_item.put.as_ref(),
@@ -759,6 +958,166 @@ fn find_operation_by_method<'a>(
         HttpMethod::Options => path_item.options.as_ref(),
         HttpMethod::Head => path_item.head.as_ref(),
         HttpMethod::Trace => path_item.trace.as_ref(),
+    }
+}
+
+impl<'a> ResolvedSpec<'a> {
+    pub fn spec(&self) -> &'a OpenAPI {
+        self.spec
+    }
+
+    pub fn operations(&self) -> impl Iterator<Item = OperationEntry<'a>> + '_ {
+        self.cache.paths.iter().flat_map(|(path, path_item)| {
+            let path = *path;
+            let path_item = *path_item;
+
+            iterate_operations(path_item).map(move |(method, operation)| OperationEntry {
+                path,
+                method,
+                operation,
+                path_item,
+            })
+        })
+    }
+
+    pub fn for_each_operation<F>(&self, mut f: F)
+    where
+        F: FnMut(OperationEntry<'a>),
+    {
+        for entry in self.operations() {
+            f(entry);
+        }
+    }
+
+    pub fn resolve_parameter(
+        &self,
+        parameter: &'a ReferenceOr<Parameter>,
+    ) -> Option<&'a Parameter> {
+        self.resolve_parameter_result(parameter).into_option()
+    }
+
+    pub fn resolve_parameter_result(
+        &self,
+        parameter: &'a ReferenceOr<Parameter>,
+    ) -> ResolveResult<'a, Parameter> {
+        match parameter {
+            ReferenceOr::Item(item) => ResolveResult::Resolved(item),
+            ReferenceOr::Reference { reference } => match ComponentRef::parse(reference) {
+                Some(ComponentRef::Parameter(name)) => self
+                    .cache
+                    .params
+                    .get(name)
+                    .copied()
+                    .map(ResolveResult::Resolved)
+                    .unwrap_or(ResolveResult::MissingReference { reference }),
+                _ => ResolveResult::UnsupportedReference { reference },
+            },
+        }
+    }
+
+    pub fn resolve_request_body(
+        &self,
+        body: &'a ReferenceOr<RequestBody>,
+    ) -> Option<&'a RequestBody> {
+        self.resolve_request_body_result(body).into_option()
+    }
+
+    pub fn resolve_request_body_result(
+        &self,
+        body: &'a ReferenceOr<RequestBody>,
+    ) -> ResolveResult<'a, RequestBody> {
+        match body {
+            ReferenceOr::Item(item) => ResolveResult::Resolved(item),
+            ReferenceOr::Reference { reference } => match ComponentRef::parse(reference) {
+                Some(ComponentRef::RequestBody(name)) => self
+                    .cache
+                    .req_bodies
+                    .get(&RequestBodyKey::Component(name))
+                    .copied(),
+                _ => None,
+            }
+            .map(ResolveResult::Resolved)
+            .unwrap_or_else(|| match ComponentRef::parse(reference) {
+                Some(ComponentRef::RequestBody(_)) => ResolveResult::MissingReference { reference },
+                _ => ResolveResult::UnsupportedReference { reference },
+            }),
+        }
+    }
+
+    pub fn resolve_response(&self, response: &'a ReferenceOr<Response>) -> Option<&'a Response> {
+        self.resolve_response_result(response).into_option()
+    }
+
+    pub fn resolve_response_result(
+        &self,
+        response: &'a ReferenceOr<Response>,
+    ) -> ResolveResult<'a, Response> {
+        match response {
+            ReferenceOr::Item(item) => ResolveResult::Resolved(item),
+            ReferenceOr::Reference { reference } => match ComponentRef::parse(reference) {
+                Some(ComponentRef::Response(name)) => self
+                    .cache
+                    .responses
+                    .get(name)
+                    .copied()
+                    .map(ResolveResult::Resolved)
+                    .unwrap_or(ResolveResult::MissingReference { reference }),
+                _ => ResolveResult::UnsupportedReference { reference },
+            },
+        }
+    }
+
+    pub fn resolve_header(&self, header: &'a ReferenceOr<Header>) -> Option<&'a Header> {
+        self.resolve_header_result(header).into_option()
+    }
+
+    pub fn resolve_header_result(
+        &self,
+        header: &'a ReferenceOr<Header>,
+    ) -> ResolveResult<'a, Header> {
+        match header {
+            ReferenceOr::Item(item) => ResolveResult::Resolved(item),
+            ReferenceOr::Reference { reference } => match ComponentRef::parse(reference) {
+                Some(ComponentRef::Header(name)) => self
+                    .cache
+                    .headers
+                    .get(name)
+                    .copied()
+                    .map(ResolveResult::Resolved)
+                    .unwrap_or(ResolveResult::MissingReference { reference }),
+                _ => ResolveResult::UnsupportedReference { reference },
+            },
+        }
+    }
+
+    pub fn resolve_schema(&self, schema: &'a ReferenceOr<Schema>) -> Option<&'a Schema> {
+        self.resolve_schema_result(schema).into_option()
+    }
+
+    pub fn resolve_schema_result(
+        &self,
+        schema: &'a ReferenceOr<Schema>,
+    ) -> ResolveResult<'a, Schema> {
+        match schema {
+            ReferenceOr::Item(item) => ResolveResult::Resolved(item),
+            ReferenceOr::Reference { reference } => match ComponentRef::parse(reference) {
+                Some(ComponentRef::Schema(name)) => self
+                    .cache
+                    .schemas
+                    .get(name)
+                    .copied()
+                    .map(ResolveResult::Resolved)
+                    .unwrap_or(ResolveResult::MissingReference { reference }),
+                _ => ResolveResult::UnsupportedReference { reference },
+            },
+        }
+    }
+
+    pub fn schemas(&self) -> impl Iterator<Item = (&'a str, &'a Schema)> + '_ {
+        self.cache
+            .schemas
+            .iter()
+            .map(|(name, schema)| (*name, *schema))
     }
 }
 
@@ -772,17 +1131,25 @@ enum ComponentRef<'a> {
     Example(&'a str),
     Link(&'a str),
     SecurityScheme(&'a str),
+    PathItem {
+        path_segment: &'a str,
+    },
+    PathOperation {
+        path_segment: &'a str,
+        method: HttpMethod,
+        has_extra: bool,
+    },
 }
 
 impl<'a> ComponentRef<'a> {
     fn parse(reference: &'a str) -> Option<Self> {
-        let mut pieces = reference
+        let pieces: Vec<_> = reference
             .trim_start_matches('#')
             .split('/')
-            .filter(|s| !s.is_empty());
-
-        match (pieces.next(), pieces.next(), pieces.next(), pieces.next()) {
-            (Some("components"), Some(kind), Some(name), None) => match kind {
+            .filter(|s| !s.is_empty())
+            .collect();
+        match pieces.as_slice() {
+            ["components", kind, name] => match *kind {
                 "parameters" => Some(Self::Parameter(name)),
                 "responses" => Some(Self::Response(name)),
                 "schemas" => Some(Self::Schema(name)),
@@ -794,23 +1161,15 @@ impl<'a> ComponentRef<'a> {
                 "securitySchemes" => Some(Self::SecurityScheme(name)),
                 _ => None,
             },
+            ["paths", path] => Some(Self::PathItem { path_segment: path }),
+            ["paths", path, method, rest @ ..] => {
+                method.parse().ok().map(|method| Self::PathOperation {
+                    path_segment: path,
+                    method,
+                    has_extra: !rest.is_empty(),
+                })
+            }
             _ => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use openapiv3::{Operation as OAPIOperation, PathItem};
-
-    #[test]
-    fn test_resolve_operation() {
-        let op = OAPIOperation {
-            ..Default::default()
-        };
-        let _param = PathItem {
-            get: Some(op),
-            ..Default::default()
-        };
     }
 }

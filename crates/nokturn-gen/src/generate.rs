@@ -224,31 +224,170 @@ fn collect_type_refs(ty: &TypeExpr, refs: &mut BTreeSet<String>) {
 }
 
 fn render_cargo_toml(config: &Config) -> String {
-    let edition = config.edition.as_deref().unwrap_or("2021");
-    let authors = config
-        .authors
-        .iter()
-        .map(|author| format!("\"{author}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let keywords = config
-        .keywords
-        .iter()
-        .map(|keyword| format!("\"{keyword}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let mut doc = toml::Table::new();
 
-    format!(
-        "[package]\nname = \"{crate_name}\"\nversion = \"{version}\"\nedition = \"{edition}\"\ndescription = \"{description}\"\nauthors = [{authors}]\nkeywords = [{keywords}]\n\n[dependencies]\nreqwest = {{ version = \"0.13\", features = [\"json\"] }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\n\n[package.metadata.nokturn]\nlib-status = \"{lib_status}\"\napi-url = \"{api_url}\"\n",
-        crate_name = config.crate_name,
-        version = config.version,
-        edition = edition,
-        description = escape_string(&config.description),
-        authors = authors,
-        keywords = keywords,
-        lib_status = escape_string(&config.lib_status),
-        api_url = escape_string(&config.api_url),
-    )
+    let mut package = toml::Table::new();
+    package.insert("name".to_string(), toml::Value::String(config.crate_name.clone()));
+    package.insert("version".to_string(), toml::Value::String(config.version.clone()));
+    package.insert(
+        "edition".to_string(),
+        toml::Value::String(config.edition.clone().unwrap_or_else(|| "2021".to_string())),
+    );
+    package.insert(
+        "description".to_string(),
+        toml::Value::String(config.description.clone()),
+    );
+    package.insert(
+        "authors".to_string(),
+        toml::Value::Array(
+            config
+                .authors
+                .iter()
+                .map(|a| toml::Value::String(a.clone()))
+                .collect(),
+        ),
+    );
+    package.insert(
+        "keywords".to_string(),
+        toml::Value::Array(
+            config
+                .keywords
+                .iter()
+                .map(|k| toml::Value::String(k.clone()))
+                .collect(),
+        ),
+    );
+    doc.insert("package".to_string(), toml::Value::Table(package));
+
+    let mut dependencies = toml::Table::new();
+    let mut reqwest = toml::Table::new();
+    reqwest.insert("version".to_string(), toml::Value::String("0.13".to_string()));
+    reqwest.insert(
+        "features".to_string(),
+        toml::Value::Array(vec![toml::Value::String("json".to_string())]),
+    );
+    dependencies.insert("reqwest".to_string(), toml::Value::Table(reqwest));
+
+    let mut serde = toml::Table::new();
+    serde.insert("version".to_string(), toml::Value::String("1".to_string()));
+    serde.insert(
+        "features".to_string(),
+        toml::Value::Array(vec![toml::Value::String("derive".to_string())]),
+    );
+    dependencies.insert("serde".to_string(), toml::Value::Table(serde));
+
+    dependencies.insert(
+        "serde_json".to_string(),
+        toml::Value::String("1".to_string()),
+    );
+    doc.insert(
+        "dependencies".to_string(),
+        toml::Value::Table(dependencies),
+    );
+
+    let mut metadata = toml::Table::new();
+    let mut nokturn = toml::Table::new();
+    nokturn.insert(
+        "lib-status".to_string(),
+        toml::Value::String(config.lib_status.clone()),
+    );
+    nokturn.insert(
+        "api-url".to_string(),
+        toml::Value::String(config.api_url.clone()),
+    );
+    metadata.insert("nokturn".to_string(), toml::Value::Table(nokturn));
+    doc.insert(
+        "package".to_string(),
+        toml::Value::Table({
+            let mut pkg = toml::Table::new();
+            pkg.insert("metadata".to_string(), toml::Value::Table(metadata));
+            pkg
+        }),
+    );
+
+    let mut root = toml::Table::new();
+    root.clone_from(&doc);
+
+    // Rebuild with correct package.metadata structure
+    let mut final_doc = toml::Table::new();
+
+    let mut final_package = toml::Table::new();
+    final_package.insert("name".to_string(), toml::Value::String(config.crate_name.clone()));
+    final_package.insert("version".to_string(), toml::Value::String(config.version.clone()));
+    final_package.insert(
+        "edition".to_string(),
+        toml::Value::String(config.edition.clone().unwrap_or_else(|| "2021".to_string())),
+    );
+    final_package.insert(
+        "description".to_string(),
+        toml::Value::String(config.description.clone()),
+    );
+    final_package.insert(
+        "authors".to_string(),
+        toml::Value::Array(
+            config
+                .authors
+                .iter()
+                .map(|a| toml::Value::String(a.clone()))
+                .collect(),
+        ),
+    );
+    final_package.insert(
+        "keywords".to_string(),
+        toml::Value::Array(
+            config
+                .keywords
+                .iter()
+                .map(|k| toml::Value::String(k.clone()))
+                .collect(),
+        ),
+    );
+
+    let mut final_metadata = toml::Table::new();
+    let mut final_nokturn = toml::Table::new();
+    final_nokturn.insert(
+        "lib-status".to_string(),
+        toml::Value::String(config.lib_status.clone()),
+    );
+    final_nokturn.insert(
+        "api-url".to_string(),
+        toml::Value::String(config.api_url.clone()),
+    );
+    final_metadata.insert("nokturn".to_string(), toml::Value::Table(final_nokturn));
+    final_package.insert(
+        "metadata".to_string(),
+        toml::Value::Table(final_metadata),
+    );
+
+    final_doc.insert("package".to_string(), toml::Value::Table(final_package));
+
+    let mut final_deps = toml::Table::new();
+    let mut final_reqwest = toml::Table::new();
+    final_reqwest.insert("version".to_string(), toml::Value::String("0.13".to_string()));
+    final_reqwest.insert(
+        "features".to_string(),
+        toml::Value::Array(vec![toml::Value::String("json".to_string())]),
+    );
+    final_deps.insert("reqwest".to_string(), toml::Value::Table(final_reqwest));
+
+    let mut final_serde = toml::Table::new();
+    final_serde.insert("version".to_string(), toml::Value::String("1".to_string()));
+    final_serde.insert(
+        "features".to_string(),
+        toml::Value::Array(vec![toml::Value::String("derive".to_string())]),
+    );
+    final_deps.insert("serde".to_string(), toml::Value::Table(final_serde));
+
+    final_deps.insert(
+        "serde_json".to_string(),
+        toml::Value::String("1".to_string()),
+    );
+    final_doc.insert(
+        "dependencies".to_string(),
+        toml::Value::Table(final_deps),
+    );
+
+    toml::to_string(&toml::Value::Table(final_doc)).expect("failed to serialize Cargo.toml")
 }
 
 fn render_lib_rs(config: &Config) -> String {
@@ -1096,7 +1235,9 @@ mod tests {
         let client_rs = std::fs::read_to_string(output.join("src/client.rs")).expect("client.rs");
 
         assert!(cargo_toml.contains("name = \"example-sdk\""));
-        assert!(cargo_toml.contains("reqwest = { version = \"0.13\", features = [\"json\"] }"));
+        assert!(cargo_toml.contains("[dependencies.reqwest]"));
+        assert!(cargo_toml.contains("version = \"0.13\""));
+        assert!(cargo_toml.contains("features = [\"json\"]"));
         assert!(lib_rs.contains("pub mod models;"));
         assert!(lib_rs.contains("pub mod operations;"));
         assert!(lib_rs.contains("pub mod client;"));

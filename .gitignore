@@ -20,5 +20,8 @@ Cargo.lock
 .vscode
 todos
 examples
-docs
+skills
+notes/
 .claude
+.codex/
+.parley/

@@ -2,8 +2,7 @@ use nokturn_core::{
     ir::{ModelId, ModelKind, ResponseStatus, build_api_ir},
     load_openapiv3,
     lowering::{LoweringDiagnosticKind, LoweringDiagnosticTarget, build_lowered_api},
-    resolver::EagerResolver,
-    resolver::ResolveResult,
+    resolver::{EagerResolver, ResolveResult},
 };
 use openapiv3::ReferenceOr;
 

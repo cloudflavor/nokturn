@@ -1,17 +1,16 @@
 use indexmap::IndexMap;
 use openapiv3::{
-    Encoding, Header as OAHeader, MediaType as OAMediaType, Operation as OAPIOperation,
-    Parameter as OAParameter, ReferenceOr, Response as OAResponse, Responses,
+    CookieStyle, Encoding, Header as OAHeader, HeaderStyle, MediaType as OAMediaType,
+    Operation as OAPIOperation, Parameter as OAParameter, PathStyle, QueryStyle, ReferenceOr,
+    Response as OAResponse, Responses,
 };
 
-use crate::{
-    ir::{
-        EncodingInfo, HeaderIr, MediaTypeIr, Operation, ParameterIr, ParameterLocation,
-        RequestBodyIr, ResponseIr, ResponseStatus, TypeExpr,
-    },
-    resolver::OperationEntry,
-    utils::HttpMethod,
+use crate::ir::{
+    EncodingInfo, HeaderIr, LiteralValue, MediaTypeIr, Operation, ParameterIr,
+    ParameterLocation, ParameterStyle, RequestBodyIr, ResponseIr, ResponseStatus, TypeExpr,
 };
+use crate::resolver::OperationEntry;
+use crate::utils::HttpMethod;
 
 use super::{LoweringDiagnosticTarget, Resolver, TypeLowerer};
 
@@ -277,44 +276,44 @@ fn encoding_to_ir(encoding: &Encoding) -> EncodingInfo {
     }
 }
 
-fn map_query_style(style: openapiv3::QueryStyle) -> crate::ir::ParameterStyle {
+fn map_query_style(style: QueryStyle) -> ParameterStyle {
     match style {
-        openapiv3::QueryStyle::Form => crate::ir::ParameterStyle::Form,
-        openapiv3::QueryStyle::SpaceDelimited => crate::ir::ParameterStyle::SpaceDelimited,
-        openapiv3::QueryStyle::PipeDelimited => crate::ir::ParameterStyle::PipeDelimited,
-        openapiv3::QueryStyle::DeepObject => crate::ir::ParameterStyle::DeepObject,
+        QueryStyle::Form => ParameterStyle::Form,
+        QueryStyle::SpaceDelimited => ParameterStyle::SpaceDelimited,
+        QueryStyle::PipeDelimited => ParameterStyle::PipeDelimited,
+        QueryStyle::DeepObject => ParameterStyle::DeepObject,
     }
 }
 
-fn map_header_style(style: openapiv3::HeaderStyle) -> crate::ir::ParameterStyle {
+fn map_header_style(style: HeaderStyle) -> ParameterStyle {
     match style {
-        openapiv3::HeaderStyle::Simple => crate::ir::ParameterStyle::Simple,
+        HeaderStyle::Simple => ParameterStyle::Simple,
     }
 }
 
-fn map_path_style(style: openapiv3::PathStyle) -> crate::ir::ParameterStyle {
+fn map_path_style(style: PathStyle) -> ParameterStyle {
     match style {
-        openapiv3::PathStyle::Matrix => crate::ir::ParameterStyle::Matrix,
-        openapiv3::PathStyle::Label => crate::ir::ParameterStyle::Label,
-        openapiv3::PathStyle::Simple => crate::ir::ParameterStyle::Simple,
+        PathStyle::Matrix => ParameterStyle::Matrix,
+        PathStyle::Label => ParameterStyle::Label,
+        PathStyle::Simple => ParameterStyle::Simple,
     }
 }
 
-fn map_cookie_style(style: openapiv3::CookieStyle) -> crate::ir::ParameterStyle {
+fn map_cookie_style(style: CookieStyle) -> ParameterStyle {
     match style {
-        openapiv3::CookieStyle::Form => crate::ir::ParameterStyle::Form,
+        CookieStyle::Form => ParameterStyle::Form,
     }
 }
 
-fn value_to_literal(value: &serde_json::Value) -> Option<crate::ir::LiteralValue> {
+fn value_to_literal(value: &serde_json::Value) -> Option<LiteralValue> {
     match value {
-        serde_json::Value::String(s) => Some(crate::ir::LiteralValue::String(s.clone())),
-        serde_json::Value::Bool(b) => Some(crate::ir::LiteralValue::Boolean(*b)),
+        serde_json::Value::String(s) => Some(LiteralValue::String(s.clone())),
+        serde_json::Value::Bool(b) => Some(LiteralValue::Boolean(*b)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Some(crate::ir::LiteralValue::Integer(i))
+                Some(LiteralValue::Integer(i))
             } else {
-                n.as_f64().map(crate::ir::LiteralValue::Number)
+                n.as_f64().map(LiteralValue::Number)
             }
         }
         _ => None,

@@ -1,16 +1,14 @@
 use std::{collections::BTreeSet, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
-use nokturn_core::{
-    ir::{
-        AdditionalBehavior, Field, HeaderIr, LiteralValue, Model, ModelId, ModelKind, Operation,
-        ParameterIr, ParameterLocation, PrimitiveKind, RequestBodyIr, ResponseIr, ResponseStatus,
-        TypeExpr,
-    },
-    lower_spec,
-    lowering::{LoweredApi, LoweringDiagnostic},
-    utils::HttpMethod,
+use nokturn_core::ir::{
+    AdditionalBehavior, Field, HeaderIr, LiteralValue, Model, ModelId, ModelKind, Operation,
+    ParameterIr, ParameterLocation, PrimitiveKind, RequestBodyIr, ResponseIr, ResponseStatus,
+    TypeExpr,
 };
+use nokturn_core::lower_spec;
+use nokturn_core::lowering::{LoweredApi, LoweringDiagnostic};
+use nokturn_core::utils::HttpMethod;
 use tokio::fs;
 
 use crate::Config;
